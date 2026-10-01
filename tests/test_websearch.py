@@ -75,24 +75,84 @@ def test_parse_ddg_unwraps_and_drops_ads():
     assert out[0]["title"] == "DDG title"
 
 
-def test_parse_yahoo_unwraps_ru_and_strips_breadcrumb():
-    html = """<html><body><div id="main"><div id="web">
-<div class="dd algo"><div class="compTitle"><h3 class="title"><a href="https://r.search.yahoo.com/_ylt=abc/RU=https%3a%2f%2fexample.com%2fpage/RK=2/RS=x">Example Title<span class="cite">example.com › page</span></a></h3></div>
-<div class="compText"><p>Example snippet.</p></div></div>
-<div class="dd algo"><div class="compTitle"><h3 class="title"><a href="https://example.org/direct">Direct</a></h3></div></div>
-<div class="dd"><div class="compTitle"><h3 class="title"><a href="https://search.yahoo.com/search?p=x">internal</a></h3></div></div>
-</div></div></body></html>"""
-    out = ws._parse_yahoo(html, 10)
-    assert len(out) == 2  # internal yahoo link dropped
-    assert out[0]["url"] == "https://example.com/page"
-    assert out[0]["title"] == "Example Title"
-    assert out[0]["snippet"] == "Example snippet."
-    assert out[1]["url"] == "https://example.org/direct"
-
-
-def test_yahoo_is_first_web_backend():
+def test_no_yahoo_backend_and_bing_html_first():
     names = [b[0] for b in ws._search_backends("q", 5, False, "")]
-    assert names[0] == "yahoo"
+    assert "yahoo" not in names
+    assert names[0] == "bing_html"
+
+
+def _fake_fetch_factory(mapping):
+    """mapping: backend-name substring -> (ok_html_or_bytes | Exception)."""
+    def fake(url, **kwargs):
+        for key, val in mapping.items():
+            if key in url:
+                if isinstance(val, Exception):
+                    raise val
+                return val, "text/html"
+        raise ws.FetchError("no mock for " + url)
+    return fake
+
+
+def test_race_first_success_wins(monkeypatch):
+    monkeypatch.setattr(ws, "_fetch", _fake_fetch_factory({
+        "bing.com/search?": BING_WEB_HTML.encode(),
+    }))
+    ws._search_cache.clear()
+    resp = ws._search_impl("python tutorial", 5, news=False)
+    assert resp["status"] == "ok"
+    assert resp["backend"] == "bing_html"
+    assert len(resp["results"]) == 2
+    assert resp["results"][0]["backend"] == "bing_html"
+
+
+def test_race_priority_beats_speed(monkeypatch):
+    # ddg succeeds but bing_html must win when both succeed
+    monkeypatch.setattr(ws, "_fetch", _fake_fetch_factory({
+        "bing.com/search?": BING_WEB_HTML.encode(),
+        "duckduckgo.com": DDG_HTML.encode(),
+        "marginalia": ws.FetchError("down"),
+    }))
+    ws._search_cache.clear()
+    resp = ws._search_impl("python tutorial", 5, news=False)
+    assert resp["backend"] == "bing_html"
+
+
+def test_race_falls_through_to_working_backend(monkeypatch):
+    monkeypatch.setattr(ws, "_fetch", _fake_fetch_factory({
+        "bing.com": ws.FetchError("blocked"),
+        "duckduckgo.com": DDG_HTML.encode(),
+    }))
+    ws._search_cache.clear()
+    resp = ws._search_impl("ddg title testing", 5, news=False)
+    assert resp["status"] == "ok"
+    assert resp["backend"] == "duckduckgo"
+
+
+def test_race_all_fail_gives_error_status(monkeypatch):
+    monkeypatch.setattr(ws, "_fetch", _fake_fetch_factory({
+        "bing.com": ws.FetchError("nope"),
+        "duckduckgo.com": ws.FetchError("nope"),
+        "marginalia": ws.FetchError("nope"),
+    }))
+    ws._search_cache.clear()
+    resp = ws._search_impl("python", 5, news=False)
+    assert resp["status"] == "error"
+    assert resp["results"] == []
+
+
+def test_search_cache_serves_repeat(monkeypatch):
+    calls = []
+    def fake(url, **kwargs):
+        calls.append(url)
+        return BING_WEB_HTML.encode(), "text/html"
+    monkeypatch.setattr(ws, "_fetch", fake)
+    ws._search_cache.clear()
+    r1 = ws._search_impl("python tutorial", 5, news=False)
+    r2 = ws._search_impl("python tutorial", 5, news=False)
+    assert r1["status"] == "ok" and r2["status"] == "ok"
+    assert r2.get("cached") is True
+    # one race = one fetch per backend (4 web backends); repeat served from cache
+    assert len(calls) == 4
 
 
 def test_parse_bing_rss():

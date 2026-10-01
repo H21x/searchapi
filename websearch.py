@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import html as html_lib
 import ipaddress
 import json
@@ -541,13 +542,6 @@ _XP_H2_A = etree.XPath('.//h2/a[@href][1]')
 _XP_CAPTION_P = etree.XPath('.//div[contains(@class,"b_caption")]//p[1]')
 _XP_DDG_A = etree.XPath('//a[contains(@class,"result__a")]')
 _XP_DDG_SNIP = etree.XPath('ancestor::div[contains(@class,"result__body")]//a[contains(@class,"result__snippet")]')
-_XP_YAHOO_A = etree.XPath(
-    '//div[@id="main"]//h3[contains(@class,"title")]/a[@href]'
-    ' | //div[contains(@class,"compTitle")]//h3/a[@href]'
-    ' | //h3[contains(@class,"title")]/a[@href]'
-)
-
-
 def _text(el) -> str:
     if isinstance(el, list):
         el = el[0] if el else None
@@ -779,64 +773,6 @@ def _parse_ddg(html: str, count: int) -> list[dict]:
     return _dedupe(out, count)
 
 
-def _yahoo_url(query: str, count: int) -> str:
-    """Yahoo web search (HTML). Primary backend: best result quality."""
-    return "https://search.yahoo.com/search?" + urlencode(
-        {"p": query, "n": min(count, 50)})
-
-
-def _unwrap_yahoo(href: str) -> str | None:
-    """Yahoo wraps outbound links via r.search.yahoo.com/.../RU=<url-encoded>/..."""
-    if not href:
-        return None
-    m = re.search(r"/RU=([^/;?#]+)", href)
-    if m:
-        target = html_lib.unescape(unquote(m.group(1)))
-        return target if target.startswith(("http://", "https://")) else None
-    try:
-        p = urlparse(urljoin("https://search.yahoo.com/", href))
-    except ValueError:
-        return None
-    if p.hostname and "yahoo.com" in p.hostname.lower():
-        return None  # internal link / consent / pagination
-    return href if p.scheme in ("http", "https") else None
-
-
-def _parse_yahoo(html: str, count: int) -> list[dict]:
-    if not html.strip():
-        return []
-    try:
-        tree = lxml_html.fromstring(html)
-    except (etree.ParserError, ValueError):
-        return []
-    out: list[dict] = []
-    for a in _XP_YAHOO_A(tree):
-        title = _text(a)
-        # Yahoo puts the "domain › path" breadcrumb inside the same link;
-        # strip the cite element's text so only the real title remains.
-        for c in a.xpath('.//*[contains(@class,"cite")]'):
-            ct = _text(c)
-            if ct and ct in title:
-                title = title.replace(ct, "").strip()
-        title = title.split("›")[0].strip()  # fallback if cite class differs
-        url = _unwrap_yahoo(a.get("href", ""))
-        if not title or not url:
-            continue
-        snippet = ""
-        container = a.xpath('ancestor::div[contains(@class,"dd")][1]')
-        if container:
-            for p in container[0].xpath(".//p[normalize-space(text())]"):
-                cand = _text(p)
-                if cand and cand != title and title not in cand:
-                    snippet = cand
-                    break
-        out.append({"title": title, "url": url, "snippet": snippet})
-        if len(out) >= count:
-            break
-    return _dedupe(out, count)
-
-
-
 def _parse_marginalia(raw: bytes, count: int) -> list[dict]:
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
@@ -992,7 +928,6 @@ def _search_backends(
             ("bing_news_rss", _bing_rss_url(query, count, True), _parse_bing_rss, True),
         ]
     return [
-        ("yahoo", _yahoo_url(query, count), _parse_yahoo, False),
         ("bing_html", _search_url(query, count, False, freshness), _parse_web, False),
         ("bing_rss", _bing_rss_url(query, count, False), _parse_bing_rss, True),
         ("duckduckgo", _ddg_url(query, count), _parse_ddg, False),
@@ -1024,6 +959,74 @@ def _shape_results(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Multi-backend search: backends race in parallel; highest-priority backend
+# with usable results wins. A short TTL cache makes repeat queries instant.
+# ---------------------------------------------------------------------------
+
+_SEARCH_RACE_DEADLINE = 15.0   # overall wall-clock cap for the backend race
+_SEARCH_CACHE_TTL = 600.0      # repeat queries served from memory for 10 min
+_SEARCH_CACHE_MAX = 500
+
+_search_cache: dict[tuple, tuple[float, dict]] = {}
+_search_cache_lock = threading.Lock()
+
+
+def _search_cache_get(key: tuple) -> dict | None:
+    with _search_cache_lock:
+        hit = _search_cache.get(key)
+        if hit is None:
+            return None
+        ts, resp = hit
+        if time.monotonic() - ts > _SEARCH_CACHE_TTL:
+            del _search_cache[key]
+            return None
+        return deepcopy(resp)
+
+
+def _search_cache_put(key: tuple, resp: dict) -> None:
+    with _search_cache_lock:
+        if len(_search_cache) >= _SEARCH_CACHE_MAX:
+            # drop the oldest entries (insertion order)
+            for old_key in list(_search_cache)[: _SEARCH_CACHE_MAX // 4]:
+                del _search_cache[old_key]
+        _search_cache[key] = (time.monotonic(), deepcopy(resp))
+
+
+def _try_backend(
+    name: str,
+    url: str,
+    parse: Callable,
+    is_bytes: bool,
+    query: str,
+    count: int,
+) -> tuple[bool, object, bool]:
+    """One backend attempt. Never raises.
+
+    Returns (ok, ranked_results | error_message, blocked).
+    """
+    try:
+        raw, _ = _fetch(url, timeout=SEARCH_TIMEOUT)
+    except (InputError, FetchError) as exc:
+        return False, f"{name}: {exc}", False
+    if _backend_blocked(name, raw):
+        return False, f"{name}: challenge/captcha", True
+    try:
+        results = parse(raw if is_bytes else raw.decode("utf-8", "replace"), count)
+    except Exception as exc:  # a parser must never kill the race
+        return False, f"{name}: parse error ({exc})", False
+    results = _near_dedupe(results)
+    if not results:
+        return False, f"{name}: 0 results", False
+    ranked = _rerank(query, results)
+    # Relevance guard: some Bing RSS answers on some IPs return "decoy
+    # items" (valid results unrelated to the query). If no query term
+    # appears in any title/snippet, this backend is not usable.
+    if set(_tokenize(query)) and ranked[0][0] <= 0:
+        return False, f"{name}: results not relevant to query", False
+    return True, ranked, False
+
+
 def _search_impl(
     query: str,
     count: int,
@@ -1031,48 +1034,64 @@ def _search_impl(
     news: bool,
     freshness: str = "",
 ) -> dict:
-    """Try backends in order; first backend with usable results wins.
+    """Race all backends in parallel; highest-priority usable result wins.
 
     Never raises for backend problems: they become structured status
     (blocked/error/empty) so the agent can decide what to do next.
     SearchResponse: {query, source_type, status, backend, message, results}.
     """
     source_type = "news" if news else "web"
-    blocked_any = False
+    cache_key = (query, count, news, freshness)
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    backends = _search_backends(query, count, news, freshness)
+    order = [b[0] for b in backends]
+    wins: dict[str, list] = {}
     errors: list[str] = []
-    for name, url, parse, is_bytes in _search_backends(query, count, news, freshness):
-        try:
-            raw, _ = _fetch(url, timeout=SEARCH_TIMEOUT)
-        except (InputError, FetchError) as exc:
-            errors.append(f"{name}: {exc}")
-            continue
-        if _backend_blocked(name, raw):
-            blocked_any = True
-            errors.append(f"{name}: challenge/captcha")
-            continue
-        try:
-            results = parse(raw if is_bytes else raw.decode("utf-8", "replace"), count)
-        except Exception as exc:  # a parser must never kill the chain
-            errors.append(f"{name}: parse error ({exc})")
-            continue
-        results = _near_dedupe(results)
-        if not results:
-            continue
-        ranked = _rerank(query, results)
-        # Relevance guard: some Bing RSS answers on some IPs return "decoy
-        # items" (valid results unrelated to the query). If no query term
-        # appears in any title/snippet, this backend is not usable -> try next.
-        if set(_tokenize(query)) and ranked[0][0] <= 0:
-            errors.append(f"{name}: results not relevant to query")
-            continue
-        return {
-            "query": query,
-            "source_type": source_type,
-            "status": "ok",
-            "backend": name,
-            "message": "",
-            "results": _shape_results(ranked, source_type, name),
+    blocked_any = False
+
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(backends), thread_name_prefix="wsrace")
+    try:
+        futs = {
+            ex.submit(_try_backend, name, url, parse, is_bytes, query, count): name
+            for name, url, parse, is_bytes in backends
         }
+        done, _pending = concurrent.futures.wait(
+            futs.keys(), timeout=_SEARCH_RACE_DEADLINE)
+        for fut in done:
+            name = futs[fut]
+            try:
+                ok, payload, blocked = fut.result()
+            except Exception as exc:  # worker itself crashed; shouldn't happen
+                errors.append(f"{name}: worker error ({exc})")
+                continue
+            if blocked:
+                blocked_any = True
+            if ok:
+                wins[name] = payload
+            else:
+                errors.append(str(payload))
+    finally:
+        # Don't block the request on stragglers; running attempts are
+        # bounded by SEARCH_TIMEOUT anyway.
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    for name in order:
+        if name in wins:
+            resp = {
+                "query": query,
+                "source_type": source_type,
+                "status": "ok",
+                "backend": name,
+                "message": "",
+                "results": _shape_results(wins[name], source_type, name),
+            }
+            _search_cache_put(cache_key, resp)
+            return resp
     if blocked_any:
         status, message = "blocked", "Backend returned challenge/captcha: " + "; ".join(errors[:3])
     elif errors:

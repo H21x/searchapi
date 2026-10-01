@@ -10,23 +10,23 @@ via `client.py`.
 
 ## How it works
 
-No search API keys. An 8-backend chain is tried in order — first backend with
-usable results wins:
+No search API keys. All backends race in parallel — the highest-priority
+backend with usable results wins (typical response 2–5s):
 
 | # | Backend | For |
 |---|---|---|
-| 1 | `yahoo` — Yahoo search (primary, best quality) | web |
-| 2 | `bing_html` — Bing results page | web |
-| 3 | `bing_rss` — Bing RSS feed | web |
-| 4 | `duckduckgo` — DDG HTML endpoint | web |
-| 5 | `marginalia` — keyless JSON API | web |
-| 6 | `google_news_rss` | news |
-| 7 | `bing_news_html` | news |
-| 8 | `bing_news_rss` | news |
+| 1 | `bing_html` — Bing results page | web |
+| 2 | `bing_rss` — Bing RSS feed | web |
+| 3 | `duckduckgo` — DDG HTML endpoint | web |
+| 4 | `marginalia` — keyless JSON API | web |
+| 5 | `google_news_rss` | news |
+| 6 | `bing_news_html` | news |
+| 7 | `bing_news_rss` | news |
 
 Requests impersonate Chrome TLS fingerprints (`curl_cffi`) so they look like a
-real browser. Results are relevance re-ranked and near-deduplicated. An SSRF
-guard only ever fetches public IPs (DNS pinning via CURLOPT_RESOLVE).
+real browser. Results are relevance re-ranked and near-deduplicated, and repeat
+queries are served from a 10-minute in-memory cache. An SSRF guard only ever
+fetches public IPs (DNS pinning via CURLOPT_RESOLVE).
 
 ## Endpoints
 

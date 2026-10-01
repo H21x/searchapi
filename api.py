@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 import websearch as engine
 from websearch import FetchError, InputError
 
-__version__ = "1.4.0"
+__version__ = "1.6.0"
 
 API_KEY = os.environ.get("API_KEY", "").strip()
 
