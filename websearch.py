@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable
 from copy import deepcopy
 from functools import lru_cache
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from curl_cffi import CurlOpt, requests as cffi_requests
 from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
@@ -541,6 +541,11 @@ _XP_H2_A = etree.XPath('.//h2/a[@href][1]')
 _XP_CAPTION_P = etree.XPath('.//div[contains(@class,"b_caption")]//p[1]')
 _XP_DDG_A = etree.XPath('//a[contains(@class,"result__a")]')
 _XP_DDG_SNIP = etree.XPath('ancestor::div[contains(@class,"result__body")]//a[contains(@class,"result__snippet")]')
+_XP_YAHOO_A = etree.XPath(
+    '//div[@id="main"]//h3[contains(@class,"title")]/a[@href]'
+    ' | //div[contains(@class,"compTitle")]//h3/a[@href]'
+    ' | //h3[contains(@class,"title")]/a[@href]'
+)
 
 
 def _text(el) -> str:
@@ -774,6 +779,64 @@ def _parse_ddg(html: str, count: int) -> list[dict]:
     return _dedupe(out, count)
 
 
+def _yahoo_url(query: str, count: int) -> str:
+    """Yahoo web search (HTML). Primary backend: best result quality."""
+    return "https://search.yahoo.com/search?" + urlencode(
+        {"p": query, "n": min(count, 50)})
+
+
+def _unwrap_yahoo(href: str) -> str | None:
+    """Yahoo wraps outbound links via r.search.yahoo.com/.../RU=<url-encoded>/..."""
+    if not href:
+        return None
+    m = re.search(r"/RU=([^/;?#]+)", href)
+    if m:
+        target = html_lib.unescape(unquote(m.group(1)))
+        return target if target.startswith(("http://", "https://")) else None
+    try:
+        p = urlparse(urljoin("https://search.yahoo.com/", href))
+    except ValueError:
+        return None
+    if p.hostname and "yahoo.com" in p.hostname.lower():
+        return None  # internal link / consent / pagination
+    return href if p.scheme in ("http", "https") else None
+
+
+def _parse_yahoo(html: str, count: int) -> list[dict]:
+    if not html.strip():
+        return []
+    try:
+        tree = lxml_html.fromstring(html)
+    except (etree.ParserError, ValueError):
+        return []
+    out: list[dict] = []
+    for a in _XP_YAHOO_A(tree):
+        title = _text(a)
+        # Yahoo puts the "domain › path" breadcrumb inside the same link;
+        # strip the cite element's text so only the real title remains.
+        for c in a.xpath('.//*[contains(@class,"cite")]'):
+            ct = _text(c)
+            if ct and ct in title:
+                title = title.replace(ct, "").strip()
+        title = title.split("›")[0].strip()  # fallback if cite class differs
+        url = _unwrap_yahoo(a.get("href", ""))
+        if not title or not url:
+            continue
+        snippet = ""
+        container = a.xpath('ancestor::div[contains(@class,"dd")][1]')
+        if container:
+            for p in container[0].xpath(".//p[normalize-space(text())]"):
+                cand = _text(p)
+                if cand and cand != title and title not in cand:
+                    snippet = cand
+                    break
+        out.append({"title": title, "url": url, "snippet": snippet})
+        if len(out) >= count:
+            break
+    return _dedupe(out, count)
+
+
+
 def _parse_marginalia(raw: bytes, count: int) -> list[dict]:
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
@@ -929,6 +992,7 @@ def _search_backends(
             ("bing_news_rss", _bing_rss_url(query, count, True), _parse_bing_rss, True),
         ]
     return [
+        ("yahoo", _yahoo_url(query, count), _parse_yahoo, False),
         ("bing_html", _search_url(query, count, False, freshness), _parse_web, False),
         ("bing_rss", _bing_rss_url(query, count, False), _parse_bing_rss, True),
         ("duckduckgo", _ddg_url(query, count), _parse_ddg, False),
@@ -1346,72 +1410,6 @@ def probe_url_impl(url: str, timeout: int = PROBE_TIMEOUT) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# AI answer: keyless AI (Pollinations) answering from the search results.
-# NOTE: bing.com/copilotsearch cannot be scraped keyless (login + bot-wall),
-# and DDG's anonymous duckchat API refuses datacenter server IPs (no
-# x-vqd-4 token -- verified live), so Pollinations is the AI source here.
-# ---------------------------------------------------------------------------
-
-_POLLINATIONS_URL = "https://text.pollinations.ai/"
-AI_ANSWER_TIMEOUT = 60
-AI_ANSWER_MODEL = "openai"
-_AI_MAX_CONTEXT_CHARS = 3000
-
-
-def _ai_context(results: list) -> str:
-    """Compact numbered context (title + snippet) for the AI prompt."""
-    parts: list[str] = []
-    total = 0
-    for i, r in enumerate(results or [], 1):
-        title = (r.get('title') or '').strip()
-        snippet = (r.get('snippet') or '').strip()
-        if not title and not snippet:
-            continue
-        chunk = f"[{i}] {title}" + (f": {snippet}" if snippet else "")
-        if total + len(chunk) > _AI_MAX_CONTEXT_CHARS:
-            break
-        parts.append(chunk)
-        total += len(chunk)
-    return "\n".join(parts)
-
-
-def ai_answer_impl(query: str, model: str = AI_ANSWER_MODEL,
-                   timeout: int = AI_ANSWER_TIMEOUT,
-                   context: str = "") -> dict:
-    """Ask keyless AI for an answer, grounded in `context` (search results).
-
-    Returns {model, answer, error}. Never raises for runtime problems --
-    error is non-empty and answer is "" when the AI call fails, so callers
-    can still return their search results.
-    """
-    query = (query or "").strip()
-    if not query:
-        raise InputError("Query is required.")
-    model = (model or AI_ANSWER_MODEL).strip() or AI_ANSWER_MODEL
-    context = (context or "").strip()
-    system = ("Answer the user's question using ONLY the search results below. "
-              "Cite sources inline like [1], [2]. If the results do not contain "
-              "the answer, say so honestly instead of guessing. Keep the answer "
-              "concise and reply in the same language as the question.")
-    prompt = query if not context else f"Question: {query}\n\nSearch results:\n{context}"
-    url = (_POLLINATIONS_URL + quote(prompt, safe="") + "?"
-           + urlencode({"model": model, "system": system}))
-    try:
-        raw, _ = _fetch(url, timeout=int(timeout))
-        answer = raw.decode("utf-8", "replace").strip()
-        if not answer:
-            return {"model": model, "answer": "",
-                    "error": "AI returned an empty answer."}
-        return {"model": model, "answer": answer, "error": ""}
-    except (InputError, FetchError) as exc:
-        return {"model": model, "answer": "", "error": str(exc)}
-    except Exception as exc:
-        return {"model": model, "answer": "",
-                "error": f"AI request failed: {exc}"}
-
-
-
-# ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
@@ -1539,12 +1537,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
     p.set_defaults(func=_cmd_probe)
 
-    p = sub.add_parser("ai", help="Ask keyless AI for an answer.")
-    p.add_argument("query", nargs="+", help="Question to ask.")
-    p.add_argument("--model", default=AI_ANSWER_MODEL,
-                   help=f"AI model (default {AI_ANSWER_MODEL}).")
-    p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
-    p.set_defaults(func=_cmd_ai)
 
     return parser
 
@@ -1592,23 +1584,6 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     _print_probe(resp, args.json)
-    return 0
-
-
-def _cmd_ai(args: argparse.Namespace) -> int:
-    try:
-        resp = ai_answer_impl(" ".join(args.query), model=args.model)
-    except InputError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if args.json:
-        print(json.dumps(resp, ensure_ascii=False, indent=2))
-    elif resp["error"]:
-        print(f"error: {resp['error']}", file=sys.stderr)
-        return 1
-    else:
-        print(f"[AI / {resp['model']}]")
-        print(resp["answer"])
     return 0
 
 

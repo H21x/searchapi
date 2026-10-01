@@ -75,6 +75,26 @@ def test_parse_ddg_unwraps_and_drops_ads():
     assert out[0]["title"] == "DDG title"
 
 
+def test_parse_yahoo_unwraps_ru_and_strips_breadcrumb():
+    html = """<html><body><div id="main"><div id="web">
+<div class="dd algo"><div class="compTitle"><h3 class="title"><a href="https://r.search.yahoo.com/_ylt=abc/RU=https%3a%2f%2fexample.com%2fpage/RK=2/RS=x">Example Title<span class="cite">example.com › page</span></a></h3></div>
+<div class="compText"><p>Example snippet.</p></div></div>
+<div class="dd algo"><div class="compTitle"><h3 class="title"><a href="https://example.org/direct">Direct</a></h3></div></div>
+<div class="dd"><div class="compTitle"><h3 class="title"><a href="https://search.yahoo.com/search?p=x">internal</a></h3></div></div>
+</div></div></body></html>"""
+    out = ws._parse_yahoo(html, 10)
+    assert len(out) == 2  # internal yahoo link dropped
+    assert out[0]["url"] == "https://example.com/page"
+    assert out[0]["title"] == "Example Title"
+    assert out[0]["snippet"] == "Example snippet."
+    assert out[1]["url"] == "https://example.org/direct"
+
+
+def test_yahoo_is_first_web_backend():
+    names = [b[0] for b in ws._search_backends("q", 5, False, "")]
+    assert names[0] == "yahoo"
+
+
 def test_parse_bing_rss():
     out = ws._parse_bing_rss(BING_RSS, 10)
     assert len(out) == 2  # <item foo="bar"> must also match (bugfix)

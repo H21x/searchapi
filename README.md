@@ -10,18 +10,19 @@ via `client.py`.
 
 ## How it works
 
-No search API keys. A 7-backend chain is tried in order — first backend with
+No search API keys. An 8-backend chain is tried in order — first backend with
 usable results wins:
 
 | # | Backend | For |
 |---|---|---|
-| 1 | `bing_html` — Bing results page | web |
-| 2 | `bing_rss` — Bing RSS feed | web |
-| 3 | `duckduckgo` — DDG HTML endpoint | web |
-| 4 | `marginalia` — keyless JSON API | web |
-| 5 | `google_news_rss` | news |
-| 6 | `bing_news_html` | news |
-| 7 | `bing_news_rss` | news |
+| 1 | `yahoo` — Yahoo search (primary, best quality) | web |
+| 2 | `bing_html` — Bing results page | web |
+| 3 | `bing_rss` — Bing RSS feed | web |
+| 4 | `duckduckgo` — DDG HTML endpoint | web |
+| 5 | `marginalia` — keyless JSON API | web |
+| 6 | `google_news_rss` | news |
+| 7 | `bing_news_html` | news |
+| 8 | `bing_news_rss` | news |
 
 Requests impersonate Chrome TLS fingerprints (`curl_cffi`) so they look like a
 real browser. Results are relevance re-ranked and near-deduplicated. An SSRF
@@ -32,7 +33,7 @@ guard only ever fetches public IPs (DNS pinning via CURLOPT_RESOLVE).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | `{"ok": true, ...}` |
-| GET | `/search?q=...&num=5&freshness=&ai=1` | Web search (+ AI answer with `ai=1`) |
+| GET | `/search?q=...&num=5&freshness=` | Web search |
 | GET | `/news?q=...&num=5&freshness=` | News search, newest first |
 | GET | `/scrape?url=...&max_chars=8000&offset=0&format=markdown` | Extract article text |
 | GET | `/probe?url=...` | Cheap pre-scrape check (status/type/size/title) |
@@ -57,29 +58,6 @@ blocked search engine is a normal outcome, not an HTTP error.
 
 Auth: if the `API_KEY` env var is set, every request needs the `X-API-Key`
 header (401 otherwise). Empty = open.
-
-### `ai=1` — AI answer inside `/search`
-
-`/search?ai=1` adds a keyless AI-generated answer to the response, grounded
-in the returned search results (cited `[1]`, `[2]`):
-
-```json
-{
-  "query": "nivin pauly new movie",
-  "status": "ok",
-  "results": [...],
-  "ai_answer": "Nivin Pauly's upcoming film is ... [1] ...",
-  "ai_model": "openai",
-  "ai_status": "ok"
-}
-```
-
-`ai_status` is `ok` | `error` | `disabled`. If the AI call fails
-(`ai_status: "error"`, reason in `ai_error`), the search results are still
-returned — nothing is lost. `ai_model` query param overrides the model.
-No API key needed. Note: `bing.com/copilotsearch` pages can't be scraped
-keyless (login + bot-wall), and Duck.ai's anonymous API refuses datacenter
-server IPs — so keyless Pollinations is the AI source here.
 
 ## Calling it from Python (e.g. your bot)
 

@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 import websearch as engine
 from websearch import FetchError, InputError
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 API_KEY = os.environ.get("API_KEY", "").strip()
 
@@ -28,8 +28,8 @@ async def _require_key(x_api_key: str | None = Header(default=None)):
 app = FastAPI(
     title="Free Web Search API",
     version=__version__,
-    description="Keyless web/news search + article scraping over a 7-backend chain, "
-                "plus keyless AI answers via /search?ai=1.",
+    description="Keyless web/news search + article scraping. Web results are led by Yahoo, "
+                "with fallback across 8 backends.",
     dependencies=[Depends(_require_key)],
 )
 
@@ -58,30 +58,13 @@ async def search(
     q: str = Query(..., description="Search query"),
     num: int = Query(5, ge=1, le=50),
     freshness: str = Query("", description="hour|day|week|month (optional)"),
-    ai: bool = Query(False, description="Include AI answer (ai_answer)"),
-    ai_model: str = Query("openai", description="AI model for ai=1"),
 ):
-    """Web search. Response: {query, source_type, status, backend, message,
-    results, ai_answer, ai_model, ai_status}.
+    """Web search. Response: {query, source_type, status, backend, message, results}.
 
     status is ok|empty|blocked|error — all HTTP 200; check `status` yourself.
-    ai=1 adds a keyless AI answer grounded in the search results.
-    ai_status is ok|error|disabled; on error ai_answer is null
-    and ai_error explains, search results are still returned.
     """
     def _run():
         res = _do_search(q, num, False, freshness)
-        if ai:
-            ctx = engine._ai_context(res.get("results"))
-            ai_res = engine.ai_answer_impl(q, model=ai_model, context=ctx)
-            res["ai_answer"] = ai_res["answer"] or None
-            res["ai_model"] = ai_res["model"]
-            res["ai_status"] = "ok" if not ai_res["error"] else "error"
-            if ai_res["error"]:
-                res["ai_error"] = ai_res["error"]
-        else:
-            res["ai_answer"] = None
-            res["ai_status"] = "disabled"
         return res
     return await asyncio.to_thread(_run)
 
