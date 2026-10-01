@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: free-websearch-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        value: ""
+        # Set a secret value in the Render dashboard to require X-API-Key.
