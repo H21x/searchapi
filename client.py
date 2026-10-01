@@ -44,9 +44,12 @@ class WebSearchClient:
         except Exception as exc:
             raise WebSearchError(str(exc)) from None
 
-    def search(self, q: str, num: int = 5, freshness: str = "") -> dict:
-        """-> {query, source_type, status, backend, message, results}"""
-        return self._get("/search", {"q": q, "num": num, "freshness": freshness})
+    def search(self, q: str, num: int = 5, freshness: str = "",
+               ai: bool = False, ai_model: str = "gpt-4o-mini") -> dict:
+        """-> {query, source_type, status, backend, message, results,
+        ai_answer, ai_model, ai_status}"""
+        return self._get("/search", {"q": q, "num": num, "freshness": freshness,
+                                     "ai": int(ai), "ai_model": ai_model})
 
     def news(self, q: str, num: int = 5, freshness: str = "") -> dict:
         return self._get("/news", {"q": q, "num": num, "freshness": freshness})
@@ -72,6 +75,12 @@ def _default_client(base_url: str = "", api_key: str = "") -> WebSearchClient:
 
 def web_search(q: str, num: int = 5, base_url: str = "", api_key: str = "") -> dict:
     return _default_client(base_url, api_key).search(q, num)
+
+
+def web_search_ai(q: str, num: int = 5, ai_model: str = "gpt-4o-mini",
+                  base_url: str = "", api_key: str = "") -> dict:
+    """Search + Duck.ai answer in one call."""
+    return _default_client(base_url, api_key).search(q, num, ai=True, ai_model=ai_model)
 
 
 def web_news(q: str, num: int = 5, base_url: str = "", api_key: str = "") -> dict:

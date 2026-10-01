@@ -5,7 +5,7 @@ Single-file, stdlib + curl_cffi/trafilatura/lxml only. Logic ported from the
 proven local-scrape v2 server (MCP plumbing, caches, and batch scraping
 removed: each CLI run is one shot, so cross-call caches cannot help).
 
-Commands: search | news | scrape | probe. Default output is compact text for
+Commands: search | news | scrape | probe | ai. Default output is compact text for
 token efficiency; --json prints the full structured response.
 """
 from __future__ import annotations
@@ -1346,6 +1346,123 @@ def probe_url_impl(url: str, timeout: int = PROBE_TIMEOUT) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# AI answer: DuckDuckGo's anonymous AI chat (the same engine behind DDG's
+# "assist" answers). Keyless: a short-lived x-vqd-4 token comes from
+# /duckchat/v1/status, then POST to /duckchat/v1/chat (SSE stream).
+# NOTE: bing.com/copilotsearch cannot be done keyless (login + aggressive
+# bot-wall), so Duck.ai is the supported AI source here.
+# ---------------------------------------------------------------------------
+
+_DUCKCHAT_STATUS_URL = "https://duckduckgo.com/duckchat/v1/status"
+_DUCKCHAT_CHAT_URL = "https://duckduckgo.com/duckchat/v1/chat"
+AI_ANSWER_TIMEOUT = 60
+AI_ANSWER_MODEL = "gpt-4o-mini"
+
+
+def _duckchat_request(method: str, url: str, timeout: float,
+                      headers: dict | None = None,
+                      json_body: dict | None = None):
+    """Same SSRF-safe pattern as _fetch_once (DNS pinning via CURLOPT_RESOLVE),
+    but for the duckchat API: custom headers, POST support, and access to
+    response headers (needed for the x-vqd-4 token). Caller closes the
+    response. Raises InputError/FetchError."""
+    original, ips = _validate_url(url)
+    p = urlparse(original)
+    port = p.port or (443 if p.scheme == "https" else 80)
+    sess = _get_session()
+    sess.curl_options = {CurlOpt.RESOLVE: list(_resolve_for(p.hostname or "", port, tuple(ips)))}
+    try:
+        if method == "POST":
+            r = sess.post(original, json=json_body, headers=headers,
+                          timeout=timeout, allow_redirects=False)
+        else:
+            r = sess.get(original, headers=headers,
+                         timeout=timeout, allow_redirects=False)
+        if r.status_code >= 400:
+            raise FetchError(f"Duck.ai request failed: HTTP {r.status_code}.")
+        return r
+    except Exception:
+        try:
+            r.close()
+        except Exception:
+            pass
+        raise
+
+
+def _duckchat_vqd_token(timeout: float) -> str:
+    r = _duckchat_request("GET", _DUCKCHAT_STATUS_URL, timeout,
+                          headers={"x-vqd-accept": "1"})
+    try:
+        token = (r.headers.get("x-vqd-4") or "").strip()
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+    if not token:
+        raise FetchError("Duck.ai did not return an x-vqd-4 token.")
+    return token
+
+
+def _parse_sse_answer(raw: bytes) -> str:
+    parts: list[str] = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        msg = obj.get("message")
+        if isinstance(msg, str) and msg:
+            parts.append(msg)
+    return "".join(parts).strip()
+
+
+def ai_answer_impl(query: str, model: str = AI_ANSWER_MODEL,
+                   timeout: int = AI_ANSWER_TIMEOUT) -> dict:
+    """Ask Duck.ai (anonymous, keyless) for an answer to `query`.
+
+    Returns {model, answer, error}. Never raises for runtime problems —
+    error is non-empty and answer is "" when the AI call fails, so callers
+    can still return their search results.
+    """
+    query = (query or "").strip()
+    if not query:
+        raise InputError("Query is required.")
+    model = (model or AI_ANSWER_MODEL).strip() or AI_ANSWER_MODEL
+    try:
+        token = _duckchat_vqd_token(min(15.0, float(timeout) / 4))
+        r = _duckchat_request(
+            "POST", _DUCKCHAT_CHAT_URL, float(timeout),
+            headers={"x-vqd-4": token, "Content-Type": "application/json"},
+            json_body={"model": model,
+                       "messages": [{"role": "user", "content": query}]},
+        )
+        try:
+            raw = r.content
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        answer = _parse_sse_answer(raw)
+        if not answer:
+            return {"model": model, "answer": "",
+                    "error": "Duck.ai returned an empty answer."}
+        return {"model": model, "answer": answer, "error": ""}
+    except (InputError, FetchError) as exc:
+        return {"model": model, "answer": "", "error": str(exc)}
+    except Exception as exc:
+        return {"model": model, "answer": "",
+                "error": f"Duck.ai request failed: {exc}"}
+
+
+# ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
@@ -1473,6 +1590,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
     p.set_defaults(func=_cmd_probe)
 
+    p = sub.add_parser("ai", help="Ask Duck.ai (anonymous, keyless) for an answer.")
+    p.add_argument("query", nargs="+", help="Question to ask.")
+    p.add_argument("--model", default=AI_ANSWER_MODEL,
+                   help=f"Duck.ai model (default {AI_ANSWER_MODEL}).")
+    p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
+    p.set_defaults(func=_cmd_ai)
+
     return parser
 
 
@@ -1519,6 +1643,23 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     _print_probe(resp, args.json)
+    return 0
+
+
+def _cmd_ai(args: argparse.Namespace) -> int:
+    try:
+        resp = ai_answer_impl(" ".join(args.query), model=args.model)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(resp, ensure_ascii=False, indent=2))
+    elif resp["error"]:
+        print(f"error: {resp['error']}", file=sys.stderr)
+        return 1
+    else:
+        print(f"[Duck.ai / {resp['model']}]")
+        print(resp["answer"])
     return 0
 
 
