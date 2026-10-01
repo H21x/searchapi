@@ -1346,88 +1346,41 @@ def probe_url_impl(url: str, timeout: int = PROBE_TIMEOUT) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# AI answer: DuckDuckGo's anonymous AI chat (the same engine behind DDG's
-# "assist" answers). Keyless: a short-lived x-vqd-4 token comes from
-# /duckchat/v1/status, then POST to /duckchat/v1/chat (SSE stream).
-# NOTE: bing.com/copilotsearch cannot be done keyless (login + aggressive
-# bot-wall), so Duck.ai is the supported AI source here.
+# AI answer: keyless AI (Pollinations) answering from the search results.
+# NOTE: bing.com/copilotsearch cannot be scraped keyless (login + bot-wall),
+# and DDG's anonymous duckchat API refuses datacenter server IPs (no
+# x-vqd-4 token -- verified live), so Pollinations is the AI source here.
 # ---------------------------------------------------------------------------
 
-_DUCKCHAT_STATUS_URL = "https://duckduckgo.com/duckchat/v1/status"
-_DUCKCHAT_CHAT_URL = "https://duckduckgo.com/duckchat/v1/chat"
+_POLLINATIONS_URL = "https://text.pollinations.ai/"
 AI_ANSWER_TIMEOUT = 60
-AI_ANSWER_MODEL = "gpt-4o-mini"
+AI_ANSWER_MODEL = "openai"
+_AI_MAX_CONTEXT_CHARS = 3000
 
 
-def _duckchat_request(method: str, url: str, timeout: float,
-                      headers: dict | None = None,
-                      json_body: dict | None = None):
-    """Same SSRF-safe pattern as _fetch_once (DNS pinning via CURLOPT_RESOLVE),
-    but for the duckchat API: custom headers, POST support, and access to
-    response headers (needed for the x-vqd-4 token). Caller closes the
-    response. Raises InputError/FetchError."""
-    original, ips = _validate_url(url)
-    p = urlparse(original)
-    port = p.port or (443 if p.scheme == "https" else 80)
-    sess = _get_session()
-    sess.curl_options = {CurlOpt.RESOLVE: list(_resolve_for(p.hostname or "", port, tuple(ips)))}
-    try:
-        if method == "POST":
-            r = sess.post(original, json=json_body, headers=headers,
-                          timeout=timeout, allow_redirects=False)
-        else:
-            r = sess.get(original, headers=headers,
-                         timeout=timeout, allow_redirects=False)
-        if r.status_code >= 400:
-            raise FetchError(f"Duck.ai request failed: HTTP {r.status_code}.")
-        return r
-    except Exception:
-        try:
-            r.close()
-        except Exception:
-            pass
-        raise
-
-
-def _duckchat_vqd_token(timeout: float) -> str:
-    r = _duckchat_request("GET", _DUCKCHAT_STATUS_URL, timeout,
-                          headers={"x-vqd-accept": "1"})
-    try:
-        token = (r.headers.get("x-vqd-4") or "").strip()
-    finally:
-        try:
-            r.close()
-        except Exception:
-            pass
-    if not token:
-        raise FetchError("Duck.ai did not return an x-vqd-4 token.")
-    return token
-
-
-def _parse_sse_answer(raw: bytes) -> str:
+def _ai_context(results: list) -> str:
+    """Compact numbered context (title + snippet) for the AI prompt."""
     parts: list[str] = []
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
+    total = 0
+    for i, r in enumerate(results or [], 1):
+        title = (r.get('title') or '').strip()
+        snippet = (r.get('snippet') or '').strip()
+        if not title and not snippet:
             continue
-        data = line[5:].strip()
-        if data == "[DONE]":
+        chunk = f"[{i}] {title}" + (f": {snippet}" if snippet else "")
+        if total + len(chunk) > _AI_MAX_CONTEXT_CHARS:
             break
-        try:
-            obj = json.loads(data)
-        except Exception:
-            continue
-        msg = obj.get("message")
-        if isinstance(msg, str) and msg:
-            parts.append(msg)
-    return "".join(parts).strip()
+        parts.append(chunk)
+        total += len(chunk)
+    return "\n".join(parts)
 
 
 def ai_answer_impl(query: str, model: str = AI_ANSWER_MODEL,
-                   timeout: int = AI_ANSWER_TIMEOUT) -> dict:
-    """Ask Duck.ai (anonymous, keyless) for an answer to `query`.
+                   timeout: int = AI_ANSWER_TIMEOUT,
+                   context: str = "") -> dict:
+    """Ask keyless AI for an answer, grounded in `context` (search results).
 
-    Returns {model, answer, error}. Never raises for runtime problems —
+    Returns {model, answer, error}. Never raises for runtime problems --
     error is non-empty and answer is "" when the AI call fails, so callers
     can still return their search results.
     """
@@ -1435,31 +1388,27 @@ def ai_answer_impl(query: str, model: str = AI_ANSWER_MODEL,
     if not query:
         raise InputError("Query is required.")
     model = (model or AI_ANSWER_MODEL).strip() or AI_ANSWER_MODEL
+    context = (context or "").strip()
+    system = ("Answer the user's question using ONLY the search results below. "
+              "Cite sources inline like [1], [2]. If the results do not contain "
+              "the answer, say so honestly instead of guessing. Keep the answer "
+              "concise and reply in the same language as the question.")
+    prompt = query if not context else f"Question: {query}\n\nSearch results:\n{context}"
+    url = (_POLLINATIONS_URL + quote(prompt, safe="") + "?"
+           + urlencode({"model": model, "system": system}))
     try:
-        token = _duckchat_vqd_token(min(15.0, float(timeout) / 4))
-        r = _duckchat_request(
-            "POST", _DUCKCHAT_CHAT_URL, float(timeout),
-            headers={"x-vqd-4": token, "Content-Type": "application/json"},
-            json_body={"model": model,
-                       "messages": [{"role": "user", "content": query}]},
-        )
-        try:
-            raw = r.content
-        finally:
-            try:
-                r.close()
-            except Exception:
-                pass
-        answer = _parse_sse_answer(raw)
+        raw, _ = _fetch(url, timeout=int(timeout))
+        answer = raw.decode("utf-8", "replace").strip()
         if not answer:
             return {"model": model, "answer": "",
-                    "error": "Duck.ai returned an empty answer."}
+                    "error": "AI returned an empty answer."}
         return {"model": model, "answer": answer, "error": ""}
     except (InputError, FetchError) as exc:
         return {"model": model, "answer": "", "error": str(exc)}
     except Exception as exc:
         return {"model": model, "answer": "",
-                "error": f"Duck.ai request failed: {exc}"}
+                "error": f"AI request failed: {exc}"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -1590,10 +1539,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
     p.set_defaults(func=_cmd_probe)
 
-    p = sub.add_parser("ai", help="Ask Duck.ai (anonymous, keyless) for an answer.")
+    p = sub.add_parser("ai", help="Ask keyless AI for an answer.")
     p.add_argument("query", nargs="+", help="Question to ask.")
     p.add_argument("--model", default=AI_ANSWER_MODEL,
-                   help=f"Duck.ai model (default {AI_ANSWER_MODEL}).")
+                   help=f"AI model (default {AI_ANSWER_MODEL}).")
     p.add_argument("--json", action="store_true", help="Print the full structured response as JSON.")
     p.set_defaults(func=_cmd_ai)
 
@@ -1658,7 +1607,7 @@ def _cmd_ai(args: argparse.Namespace) -> int:
         print(f"error: {resp['error']}", file=sys.stderr)
         return 1
     else:
-        print(f"[Duck.ai / {resp['model']}]")
+        print(f"[AI / {resp['model']}]")
         print(resp["answer"])
     return 0
 

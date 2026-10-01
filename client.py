@@ -45,7 +45,7 @@ class WebSearchClient:
             raise WebSearchError(str(exc)) from None
 
     def search(self, q: str, num: int = 5, freshness: str = "",
-               ai: bool = False, ai_model: str = "gpt-4o-mini") -> dict:
+               ai: bool = False, ai_model: str = "openai") -> dict:
         """-> {query, source_type, status, backend, message, results,
         ai_answer, ai_model, ai_status}"""
         return self._get("/search", {"q": q, "num": num, "freshness": freshness,
@@ -77,9 +77,9 @@ def web_search(q: str, num: int = 5, base_url: str = "", api_key: str = "") -> d
     return _default_client(base_url, api_key).search(q, num)
 
 
-def web_search_ai(q: str, num: int = 5, ai_model: str = "gpt-4o-mini",
+def web_search_ai(q: str, num: int = 5, ai_model: str = "openai",
                   base_url: str = "", api_key: str = "") -> dict:
-    """Search + Duck.ai answer in one call."""
+    """Search + AI answer in one call."""
     return _default_client(base_url, api_key).search(q, num, ai=True, ai_model=ai_model)
 
 

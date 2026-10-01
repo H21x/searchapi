@@ -32,7 +32,7 @@ guard only ever fetches public IPs (DNS pinning via CURLOPT_RESOLVE).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | `{"ok": true, ...}` |
-| GET | `/search?q=...&num=5&freshness=&ai=1` | Web search (+ Duck.ai answer with `ai=1`) |
+| GET | `/search?q=...&num=5&freshness=&ai=1` | Web search (+ AI answer with `ai=1`) |
 | GET | `/news?q=...&num=5&freshness=` | News search, newest first |
 | GET | `/scrape?url=...&max_chars=8000&offset=0&format=markdown` | Extract article text |
 | GET | `/probe?url=...` | Cheap pre-scrape check (status/type/size/title) |
@@ -58,18 +58,18 @@ blocked search engine is a normal outcome, not an HTTP error.
 Auth: if the `API_KEY` env var is set, every request needs the `X-API-Key`
 header (401 otherwise). Empty = open.
 
-### `ai=1` — Duck.ai answer inside `/search`
+### `ai=1` — AI answer inside `/search`
 
-`/search?ai=1` adds a keyless AI-generated answer to the response — the same
-anonymous Duck.ai engine behind DuckDuckGo's "assist" answers:
+`/search?ai=1` adds a keyless AI-generated answer to the response, grounded
+in the returned search results (cited `[1]`, `[2]`):
 
 ```json
 {
   "query": "nivin pauly new movie",
   "status": "ok",
   "results": [...],
-  "ai_answer": "Nivin Pauly's upcoming film is ...",
-  "ai_model": "gpt-4o-mini",
+  "ai_answer": "Nivin Pauly's upcoming film is ... [1] ...",
+  "ai_model": "openai",
   "ai_status": "ok"
 }
 ```
@@ -78,7 +78,8 @@ anonymous Duck.ai engine behind DuckDuckGo's "assist" answers:
 (`ai_status: "error"`, reason in `ai_error`), the search results are still
 returned — nothing is lost. `ai_model` query param overrides the model.
 No API key needed. Note: `bing.com/copilotsearch` pages can't be scraped
-keyless (login + bot-wall), so Duck.ai is the supported AI source.
+keyless (login + bot-wall), and Duck.ai's anonymous API refuses datacenter
+server IPs — so keyless Pollinations is the AI source here.
 
 ## Calling it from Python (e.g. your bot)
 
